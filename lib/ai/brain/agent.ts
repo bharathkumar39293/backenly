@@ -291,6 +291,8 @@ export type BrainFailureCode =
   | 'NEEDS_USER'
   /** A tool refused on the merits. Retrying the same call will refuse again. */
   | 'TOOL_REFUSED'
+  /** A mutation may have landed, but its resulting state was not verified. Do not replay it. */
+  | 'UNVERIFIED'
 
 const MAX_ITERATIONS = 12
 
@@ -1240,6 +1242,11 @@ async function runAgentLoop(
 
   let mutated = false
   let verifiedAfterMutation = false
+  // A verification tool can fail after a mutation has already committed. That
+  // is an incomplete outcome, not evidence that the mutation failed and not a
+  // reason to ask the model to replay it.
+  let verificationFailedAfterMutation = false
+  let verificationRequestedAfterMutation = false
   let finalSummary = ''
   let success = false
   let needsUser = false
@@ -1286,6 +1293,20 @@ async function runAgentLoop(
   // BrainResult.blockedCalls so the caller can queue each one for a human;
   // nothing here is ever executed by the brain itself.
   const blockedCalls: BlockedCall[] = []
+
+  const unverifiedMutationSummary =
+    'I applied changes, but could not verify the resulting state. The mutation may have succeeded, so I did not retry it. Inspect the current backend state before making another change.'
+
+  const requestPostMutationVerification = (results: Anthropic.ToolResultBlockParam[] = []) => {
+    verificationRequestedAfterMutation = true
+    emit({ type: 'phase', phase: 'verify' })
+    messages.push({
+      role: 'user',
+      content: [...results, { type: 'text', text:
+        'You mutated state but have not verified it. Run ONE verification pass — a single read_backend_state, plus at most one run_test on a new endpoint — then finish with a truthful summary. Do not test create/list/get separately; one passing call is enough.',
+      }]
+    })
+  }
 
   /** Set when the loop stopped to protect its verification reserve. */
   let budgetStopped = false
@@ -1376,6 +1397,19 @@ async function runAgentLoop(
 
     const toolCalls = toolUsesOf(reply.message)
     if (toolCalls.length === 0) {
+      // A plain-text answer is not proof of a mutation. Give the model one
+      // bounded chance to run the ordinary verification tool, then return an
+      // honest incomplete result rather than presenting an unverified success.
+      if (mutated && !verifiedAfterMutation) {
+        if (verificationFailedAfterMutation || verificationRequestedAfterMutation) {
+          finalSummary = unverifiedMutationSummary
+          success = false
+          break
+        }
+        messages.push({ role: 'assistant', content: reply.message.content })
+        requestPostMutationVerification()
+        continue
+      }
       // Model answered without tools — accept its text as the final summary.
       finalSummary = text || 'Done.'
       success = true
@@ -1442,9 +1476,12 @@ async function runAgentLoop(
       toolStatuses.push(result.ok ? 'applied' : 'failed')
       console.log(`[Brain] tool=${toolName} ok=${result.ok} terminal=${!!result.terminal} summary="${result.summary.slice(0, 120)}"`)
 
-      // Track verification cadence
-      if (toolName === 'read_backend_state' && mutated) verifiedAfterMutation = true
-      if (toolName === 'run_test' && mutated) verifiedAfterMutation = true
+      // Track verification cadence. A failed read/test is not verification:
+      // the mutation may have committed, but its postcondition is unknown.
+      if ((toolName === 'read_backend_state' || toolName === 'run_test') && mutated) {
+        verifiedAfterMutation = result.ok
+        verificationFailedAfterMutation = !result.ok
+      }
       // Allowlist-driven: a mutation is anything that is NOT a control tool and
       // NOT a read-only tool. Adding a new read tool to tools.READ_ONLY_TOOLS
       // (or a control tool to CONTROL_TOOLS above) keeps this honest without
@@ -1452,6 +1489,8 @@ async function runAgentLoop(
       const isMutation = !isReadOnlyTool(toolName) && !CONTROL_TOOLS.has(toolName)
       if (isMutation) {
         mutated = true
+        verificationFailedAfterMutation = false
+        verificationRequestedAfterMutation = false
         // ── A self-verifying tool does not need a verification pass ───────────
         //
         // Verification was a single step at the END of the run, so it was always
@@ -1487,6 +1526,11 @@ async function runAgentLoop(
           : result.summary
       results.push(toolResultBlock(toolCall.id, { ok: result.ok, summary: clippedSummary }, !result.ok))
 
+      // Tool calls can arrive in a batch. Once the verification read failed,
+      // do not execute a later call in that batch: it could replay a mutation
+      // whose original outcome is already uncertain.
+      if (mutated && verificationFailedAfterMutation) break
+
       if (result.terminal) {
         finalSummary = result.summary || 'Done.'
         needsUser = !!result.needsUser
@@ -1496,11 +1540,26 @@ async function runAgentLoop(
       }
     }
 
+    // Do not give the model another opportunity to replay a mutation after a
+    // verification read failed. The mutation may already be committed, while
+    // the resulting state is simply unavailable to us right now.
+    if (mutated && verificationFailedAfterMutation) {
+      finalSummary = unverifiedMutationSummary
+      success = false
+      break
+    }
+
     if (finished) {
       // Steer the model to verify if it tried to finish after mutating. The
       // steer rides in the same user turn as the results: the routed models
       // take no system message mid-conversation.
       if (mutated && !verifiedAfterMutation && !needsUser) {
+        if (verificationRequestedAfterMutation) {
+          finalSummary = unverifiedMutationSummary
+          success = false
+          break
+        } else {
+          verificationRequestedAfterMutation = true
         emit({ type: 'phase', phase: 'verify' })
         messages.push({
           role: 'user',
@@ -1512,6 +1571,7 @@ async function runAgentLoop(
             },
           ],
         })
+        }
         success = false
         continue
       }
@@ -1603,6 +1663,8 @@ async function runAgentLoop(
       ? modelFailure.code
       : needsUser
         ? 'NEEDS_USER'
+        : verificationFailedAfterMutation || (mutated && verificationRequestedAfterMutation && !verifiedAfterMutation)
+          ? 'UNVERIFIED'
         : iter >= MAX_ITERATIONS
           ? 'STEP_BUDGET_EXHAUSTED'
           : toolStatuses.includes('failed')
